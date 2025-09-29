@@ -1,51 +1,40 @@
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.3";
 
-const PROJECT_URL = Deno.env.get("PROJECT_URL")!;
-const SERVICE_ROLE_KEY = Deno.env.get("SERVICE_ROLE_KEY")!;
+const PROJECT_URL       = Deno.env.get("PROJECT_URL")!;
+const SERVICE_ROLE_KEY  = Deno.env.get("SERVICE_ROLE_KEY")!;
 const DEFAULT_SITE_HOST = Deno.env.get("DEFAULT_SITE_HOST")!;
-
-const WP_PUSH_URL = Deno.env.get("WP_PUSH_URL")!;
-const WP_HMAC_SECRET = Deno.env.get("WP_HMAC_SECRET") || ""; // if using HMAC
-const WP_APP_USER = Deno.env.get("WP_APP_USER") || "";
-const WP_APP_PASSWORD = Deno.env.get("WP_APP_PASSWORD") || "";
+const WP_PUSH_URL       = Deno.env.get("WP_PUSH_URL")!;
+const WP_HMAC_SECRET    = Deno.env.get("WP_HMAC_SECRET")!; // required
 
 type PublishInput = { slug: string; site_host?: string };
 
 function requireBearer(req: Request) {
-  const hdr = req.headers.get("authorization") || "";
-  const token = hdr.toLowerCase().startsWith("bearer ") ? hdr.slice(7) : "";
-  if (!token || token !== SERVICE_ROLE_KEY) {
-    return new Response(JSON.stringify({ ok: false, error: "unauthorized" }), {
-      status: 401,
-      headers: { "content-type": "application/json" },
+  const a = req.headers.get("authorization") || "";
+  const t = a.toLowerCase().startsWith("bearer ") ? a.slice(7) : "";
+  if (t !== SERVICE_ROLE_KEY) {
+    return new Response(JSON.stringify({ok:false,error:"unauthorized"}), {
+      status: 401, headers: { "content-type": "application/json" },
     });
   }
   return null;
 }
 
-function hmacSign(secret: string, body: string) {
-  const key = crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
+async function hmacHex(secret: string, msg: string) {
+  const key = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(secret), { name:"HMAC", hash:"SHA-256" }, false, ["sign"]
   );
-  return key.then(k => crypto.subtle.sign("HMAC", k, new TextEncoder().encode(body)))
-    .then(sig => {
-      const bytes = new Uint8Array(sig);
-      return Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
-    });
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(msg));
+  const b = new Uint8Array(sig);
+  return Array.from(b).map(x => x.toString(16).padStart(2,"0")).join("");
 }
 
 serve(async (req) => {
   if (req.method !== "POST") {
-    return new Response(JSON.stringify({ ok: true, fn: "collections-publish" }), {
-      headers: { "content-type": "application/json" },
+    return new Response(JSON.stringify({ ok:true, fn:"collections-publish" }), {
+      headers: { "content-type":"application/json" },
     });
   }
-
   const unauth = requireBearer(req);
   if (unauth) return unauth;
 
@@ -56,8 +45,8 @@ serve(async (req) => {
   if (!input?.slug) {
     return new Response(JSON.stringify({ ok:false, error:"slug_required" }), { status:400, headers:{ "content-type":"application/json" }});
   }
-  const site_host = input.site_host || DEFAULT_SITE_HOST;
 
+  const site_host = input.site_host || DEFAULT_SITE_HOST;
   const supabase = createClient(PROJECT_URL, SERVICE_ROLE_KEY, { auth: { persistSession:false } });
 
   // 1) Load collection
@@ -69,9 +58,9 @@ serve(async (req) => {
     .maybeSingle();
 
   if (error) return new Response(JSON.stringify({ ok:false, error:error.message }), { status:500, headers:{ "content-type":"application/json" }});
-  if (!col) return new Response(JSON.stringify({ ok:false, error:"collection_not_found" }), { status:404, headers:{ "content-type":"application/json" }});
+  if (!col)    return new Response(JSON.stringify({ ok:false, error:"collection_not_found" }), { status:404, headers:{ "content-type":"application/json" }});
 
-  // 2) Build payload for WP
+  // 2) Build payload
   const payload = {
     slug: col.slug,
     site_host: col.site_host,
@@ -82,48 +71,51 @@ serve(async (req) => {
     canonical: col.canonical,
     description_html: col.description_html,
     faq: col.faq,
-    product_ids: col.assigned_product_ids || [], // resolved IDs
+    product_ids: col.assigned_product_ids || [],
     sort_by: col.sort_by || "popularity",
     paginate: col.paginate || 24,
     version: col.version || 1,
     updated_at: col.updated_at,
   };
-  const bodyStr = JSON.stringify(payload);
+  const body = JSON.stringify(payload);
 
-  // 3) Prepare auth
-  const headers: Record<string,string> = { "content-type": "application/json" };
-  if (WP_HMAC_SECRET) {
-    const sig = await hmacSign(WP_HMAC_SECRET, bodyStr);
-    headers["x-sc-signature"] = sig;
-  } else if (WP_APP_USER && WP_APP_PASSWORD) {
-    const basic = btoa(`${WP_APP_USER}:${WP_APP_PASSWORD}`);
-    headers["authorization"] = `Basic ${basic}`;
-  } else {
-    return new Response(JSON.stringify({ ok:false, error:"no_wp_auth_configured" }), { status:500, headers:{ "content-type":"application/json" }});
-  }
+  // 3) HMAC sign with timestamp
+  const ts = Math.floor(Date.now() / 1000).toString(); // seconds
+  const toSign = `${ts}.${body}`;
+  const sig = await hmacHex(WP_HMAC_SECRET, toSign);
+
+  const headers = {
+    "content-type": "application/json",
+    "x-sc-timestamp": ts,
+    "x-sc-signature": sig,
+  };
 
   // 4) Push to WordPress
-  const wpRes = await fetch(WP_PUSH_URL, { method:"POST", headers, body: bodyStr });
-  const wpText = await wpRes.text();
+  const res = await fetch(WP_PUSH_URL, { method:"POST", headers, body });
+  const text = await res.text();
 
-  // 5) Log push
+  // 5) Log result
   await supabase.from("push_log").insert({
     slug: col.slug,
     version_pushed: col.version ?? 1,
-    http_status: wpRes.status,
-    response_body: (() => { try { return JSON.parse(wpText); } catch { return { text: wpText }; } })(),
+    http_status: res.status,
+    response_body: (() => { try { return JSON.parse(text); } catch { return { text }; } })(),
   });
 
-  if (!wpRes.ok) {
-    return new Response(JSON.stringify({ ok:false, wp_status: wpRes.status, wp_body: wpText }), { status:502, headers:{ "content-type":"application/json" }});
+  if (!res.ok) {
+    return new Response(JSON.stringify({ ok:false, wp_status:res.status, wp_body:text }), {
+      status: 502, headers: { "content-type":"application/json" },
+    });
   }
 
   // 6) Mark published
   await supabase
     .from("collections")
-    .update({ status: "published", updated_at: new Date().toISOString() })
+    .update({ status:"published", updated_at:new Date().toISOString() })
     .eq("site_host", site_host)
     .eq("slug", input.slug);
 
-  return new Response(JSON.stringify({ ok:true, pushed:true, wp_status: wpRes.status }), { headers:{ "content-type":"application/json" }});
+  return new Response(JSON.stringify({ ok:true, pushed:true, wp_status:res.status }), {
+    headers: { "content-type":"application/json" },
+  });
 });
