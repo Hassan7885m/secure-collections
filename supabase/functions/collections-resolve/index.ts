@@ -1,151 +1,199 @@
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.3";
 
-const PROJECT_URL = Deno.env.get("PROJECT_URL")!;
-const SERVICE_ROLE_KEY = Deno.env.get("SERVICE_ROLE_KEY")!;
+const PROJECT_URL       = Deno.env.get("PROJECT_URL")!;
+const SERVICE_ROLE_KEY  = Deno.env.get("SERVICE_ROLE_KEY")!;
 const DEFAULT_SITE_HOST = Deno.env.get("DEFAULT_SITE_HOST") || "hassan.skillyweb.com";
 
-const WOO_BASE_URL = Deno.env.get("WOO_BASE_URL")!;
-const WOO_CK = Deno.env.get("WOO_CK")!;
-const WOO_CS = Deno.env.get("WOO_CS")!;
+const WOO_BASE_URL = Deno.env.get("WOO_BASE_URL") || "";
+const WOO_CK       = Deno.env.get("WOO_CK") || "";
+const WOO_CS       = Deno.env.get("WOO_CS") || "";
+const WP_HMAC_SECRET = Deno.env.get("WP_HMAC_SECRET") || ""; // used for runtime HMAC auth
 
-type ResolveInput = {
-  slug: string;
-  site_host?: string;
-};
+type ResolveInput = { op?: "resolve"|"render"|"config"; slug?: string; site_host?: string; runtime_resolve?: boolean };
 
 type WooProduct = { id: number; sku: string };
 
+function json(status: number, body: unknown) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+// ---- Auth helpers ----
 function requireBearer(req: Request) {
-  const hdr = req.headers.get("authorization") || "";
-  const token = hdr.toLowerCase().startsWith("bearer ") ? hdr.slice(7) : "";
-  if (!token || token !== SERVICE_ROLE_KEY) {
-    return new Response(JSON.stringify({ ok: false, error: "unauthorized" }), {
-      status: 401,
-      headers: { "content-type": "application/json" },
-    });
-  }
+  const h = req.headers.get("authorization") || "";
+  const token = h.toLowerCase().startsWith("bearer ") ? h.slice(7) : "";
+  if (token !== SERVICE_ROLE_KEY) return json(401, { ok:false, error:"unauthorized" });
   return null;
 }
 
+async function verifyHmac(req: Request) {
+  if (!WP_HMAC_SECRET) return json(500, { ok:false, error:"server_missing_hmac_secret" });
+  const ts = req.headers.get("x-sc-timestamp");
+  const sig = req.headers.get("x-sc-signature");
+  if (!ts || !sig) return json(401, { ok:false, error:"missing_signature" });
+  const now = Math.floor(Date.now()/1000);
+  if (Math.abs(now - parseInt(ts,10)) > 300) return json(401, { ok:false, error:"stale_signature" });
+  const raw = await req.clone().text();
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", enc.encode(WP_HMAC_SECRET), {name:"HMAC", hash:"SHA-256"}, false, ["sign"]);
+  const signed = await crypto.subtle.sign("HMAC", key, enc.encode(`${ts}.${raw}`));
+  const hex = Array.from(new Uint8Array(signed)).map(b=>b.toString(16).padStart(2,"0")).join("");
+  if (hex !== sig) return json(401, { ok:false, error:"bad_signature" });
+  return null;
+}
+
+// ---- Woo helper ----
 async function fetchWooBySku(sku: string): Promise<WooProduct | null> {
-  // /wp-json/wc/v3/products?sku=<sku>
+  if (!WOO_BASE_URL || !WOO_CK || !WOO_CS) return null;
   const url = new URL("/wp-json/wc/v3/products", WOO_BASE_URL);
   url.searchParams.set("sku", sku);
   url.searchParams.set("consumer_key", WOO_CK);
   url.searchParams.set("consumer_secret", WOO_CS);
-
   const res = await fetch(url.toString(), { headers: { accept: "application/json" } });
-  if (!res.ok) {
-    console.warn("Woo error", sku, res.status);
-    return null;
-  }
+  if (!res.ok) return null;
   const arr = (await res.json()) as WooProduct[];
   return Array.isArray(arr) && arr.length ? arr[0] : null;
 }
 
 serve(async (req) => {
   if (req.method !== "POST") {
-    return new Response(JSON.stringify({ ok: true, fn: "collections-resolve" }), {
-      headers: { "content-type": "application/json" },
-    });
+    return json(200, { ok:true, fn:"collections-resolve" });
   }
 
+  let body: ResolveInput;
+  try { body = await req.json(); } catch { return json(400, { ok:false, error:"invalid_json" }); }
+
+  const op = body.op || "resolve";
+  const site_host = body.site_host || DEFAULT_SITE_HOST;
+  const supabase = createClient(PROJECT_URL, SERVICE_ROLE_KEY, { auth: { persistSession:false } });
+
+  // ---- CONFIG (runtime) ----
+  if (op === "config") {
+    const unauth = await verifyHmac(req);
+    if (unauth) return unauth;
+
+    const { data: st, error: e } = await supabase
+      .from("site_settings")
+      .select("collections_enabled, collections_base, maintenance_message")
+      .eq("site_host", site_host)
+      .maybeSingle();
+
+    if (e)   return json(500, { ok:false, error:e.message });
+    if (!st) return json(404, { ok:false, error:"settings_not_found" });
+
+    return json(200, { ok:true, settings: st });
+  }
+
+  // ---- RENDER (runtime) ----
+  if (op === "render") {
+    const unauth = await verifyHmac(req);
+    if (unauth) return unauth;
+
+    // 1) settings
+    const { data: st, error: se } = await supabase
+      .from("site_settings")
+      .select("collections_enabled, collections_base, maintenance_message")
+      .eq("site_host", site_host)
+      .maybeSingle();
+    if (se)   return json(500, { ok:false, error: se.message });
+    if (!st)  return json(404, { ok:false, error: "settings_not_found" });
+
+    // 2) collection
+    if (!body.slug) return json(400, { ok:false, error:"slug_required" });
+    const { data: col, error: ce } = await supabase
+      .from("collections")
+      .select("*")
+      .eq("site_host", site_host)
+      .eq("slug", body.slug)
+      .maybeSingle();
+    if (ce)   return json(500, { ok:false, error: ce.message });
+    if (!col) return json(404, { ok:false, error:"collection_not_found" });
+
+    // Optional runtime refresh of product IDs if asked
+    if (body.runtime_resolve && Array.isArray(col.assigned_skus) && col.assigned_skus.length) {
+      const ids: number[] = [];
+      for (const sku of col.assigned_skus) {
+        const p = await fetchWooBySku(sku);
+        if (p?.id) ids.push(p.id);
+        await new Promise(r=>setTimeout(r, 80));
+      }
+      // do not fail the response if update fails
+      await supabase
+        .from("collections")
+        .update({ assigned_product_ids: ids, updated_at: new Date().toISOString() })
+        .eq("site_host", site_host)
+        .eq("slug", body.slug);
+      col.assigned_product_ids = ids;
+    }
+
+    // minimal payload for WP template
+    const payload = {
+      slug: col.slug,
+      title: col.title,
+      h1: col.h1,
+      meta_title: col.meta_title,
+      meta_description: col.meta_description,
+      canonical: col.canonical,
+      description_html: col.description_html,
+      faq: col.faq ?? [],
+      assigned_skus: col.assigned_skus ?? [],
+      assigned_product_ids: col.assigned_product_ids ?? [],
+      sort_by: col.sort_by ?? "popularity",
+      paginate: col.paginate ?? 24,
+      status: col.status,
+      version: col.version ?? 1,
+      updated_at: col.updated_at,
+    };
+
+    return json(200, { ok:true, settings: st, collection: payload });
+  }
+
+  // ---- RESOLVE (admin) ----
+  // default op if none given; requires Bearer SERVICE_ROLE_KEY
   const unauth = requireBearer(req);
   if (unauth) return unauth;
 
-  let body: ResolveInput;
-  try {
-    body = await req.json();
-  } catch {
-    return new Response(JSON.stringify({ ok: false, error: "invalid_json" }), {
-      status: 400,
-      headers: { "content-type": "application/json" },
-    });
-  }
+  if (!body.slug) return json(400, { ok:false, error:"slug_required" });
 
-  if (!body?.slug) {
-    return new Response(JSON.stringify({ ok: false, error: "slug_required" }), {
-      status: 400,
-      headers: { "content-type": "application/json" },
-    });
-  }
-  const site_host = body.site_host || DEFAULT_SITE_HOST;
-
-  const supabase = createClient(PROJECT_URL, SERVICE_ROLE_KEY, {
-    auth: { persistSession: false },
-  });
-
-  // 1) Load collection
-  const { data: col, error: getErr } = await supabase
+  // load collection
+  const { data: col, error: ge } = await supabase
     .from("collections")
     .select("*")
     .eq("site_host", site_host)
     .eq("slug", body.slug)
     .maybeSingle();
 
-  if (getErr) {
-    return new Response(JSON.stringify({ ok: false, error: getErr.message }), {
-      status: 500,
-      headers: { "content-type": "application/json" },
-    });
-  }
-  if (!col) {
-    return new Response(JSON.stringify({ ok: false, error: "collection_not_found" }), {
-      status: 404,
-      headers: { "content-type": "application/json" },
-    });
-  }
+  if (ge)   return json(500, { ok:false, error: ge.message });
+  if (!col) return json(404, { ok:false, error:"collection_not_found" });
 
   const skus: string[] = Array.isArray(col.assigned_skus) ? col.assigned_skus : [];
   if (!skus.length) {
-    // Nothing to resolve; clear any previous IDs
     await supabase
       .from("collections")
       .update({ assigned_product_ids: [], updated_at: new Date().toISOString() })
       .eq("site_host", site_host)
       .eq("slug", body.slug);
-    return new Response(JSON.stringify({ ok: true, count: 0, missing: [] }), {
-      headers: { "content-type": "application/json" },
-    });
+    return json(200, { ok:true, count:0, missing:[], ids:[] });
   }
 
-  // 2) Resolve each SKU → Woo product id
   const foundIds: number[] = [];
   const missing: string[] = [];
-
-  // Serial to keep it simple & avoid Woo rate limits. You can parallelize later.
   for (const sku of skus) {
-    try {
-      const prod = await fetchWooBySku(sku);
-      if (prod?.id) foundIds.push(prod.id);
-      else missing.push(sku);
-      // small delay to be gentle with Woo
-      await new Promise((r) => setTimeout(r, 120));
-    } catch {
-      missing.push(sku);
-    }
+    const prod = await fetchWooBySku(sku);
+    if (prod?.id) foundIds.push(prod.id);
+    else missing.push(sku);
+    await new Promise(r=>setTimeout(r, 120));
   }
 
-  // 3) Save result
-  const { error: updErr } = await supabase
+  const { error: ue } = await supabase
     .from("collections")
-    .update({
-      assigned_product_ids: foundIds,
-      updated_at: new Date().toISOString(),
-    })
+    .update({ assigned_product_ids: foundIds, updated_at: new Date().toISOString() })
     .eq("site_host", site_host)
     .eq("slug", body.slug);
 
-  if (updErr) {
-    return new Response(JSON.stringify({ ok: false, error: updErr.message }), {
-      status: 500,
-      headers: { "content-type": "application/json" },
-    });
-  }
-
-  return new Response(
-    JSON.stringify({ ok: true, count: foundIds.length, missing, ids: foundIds }),
-    { headers: { "content-type": "application/json" } }
-  );
+  if (ue) return json(500, { ok:false, error: ue.message });
+  return json(200, { ok:true, count: foundIds.length, missing, ids: foundIds });
 });
