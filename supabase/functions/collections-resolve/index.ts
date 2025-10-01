@@ -96,7 +96,7 @@ serve(async (req) => {
     return json(200, { ok: true, fn: "collections-resolve" });
   }
 
-  // Read body ONCE (avoid "Body is unusable")
+  // Read body ONCE
   const raw = await req.text();
   let body: ResolveInput;
   try {
@@ -120,7 +120,7 @@ serve(async (req) => {
 
     const { data: st, error: e } = await supabase
       .from("site_settings")
-      .select("collections_enabled, collections_base, maintenance_message")
+      .select("collections_enabled, collections_base, maintenance_message, render_mode, theme_map")
       .eq("site_host", site_host)
       .maybeSingle();
 
@@ -138,7 +138,7 @@ serve(async (req) => {
     // 1) settings
     const { data: st, error: se } = await supabase
       .from("site_settings")
-      .select("collections_enabled, collections_base, maintenance_message")
+      .select("collections_enabled, collections_base, maintenance_message, render_mode, theme_map")
       .eq("site_host", site_host)
       .maybeSingle();
 
@@ -164,10 +164,8 @@ serve(async (req) => {
       for (const sku of col.assigned_skus) {
         const p = await fetchWooBySku(sku);
         if (p?.id) ids.push(p.id);
-        // Small delay to be nice to Woo
         await new Promise(r => setTimeout(r, 80));
       }
-      // Update DB (best-effort; ignore error in response)
       await supabase
         .from("collections")
         .update({ assigned_product_ids: ids, updated_at: new Date().toISOString() })
@@ -176,7 +174,7 @@ serve(async (req) => {
       (col as any).assigned_product_ids = ids;
     }
 
-    // Minimal payload for WP template
+    // Minimal payload for WP template (no pagination/sort added here)
     const payload = {
       slug: col.slug,
       title: col.title,
@@ -189,13 +187,23 @@ serve(async (req) => {
       assigned_skus: col.assigned_skus ?? [],
       assigned_product_ids: col.assigned_product_ids ?? [],
       sort_by: col.sort_by ?? "popularity",
-      paginate: col.paginate ?? 24,
+      paginate: col.paginate ?? 24, // kept as-is but not used for new logic now
       status: col.status,
       version: col.version ?? 1,
       updated_at: col.updated_at,
     };
 
-    return json(200, { ok: true, settings: st, collection: payload });
+    return json(200, {
+      ok: true,
+      settings: {
+        collections_enabled: st.collections_enabled,
+        collections_base: st.collections_base,
+        maintenance_message: st.maintenance_message,
+        render_mode: st.render_mode ?? "native",
+        theme_map: st.theme_map ?? {},
+      },
+      collection: payload,
+    });
   }
 
   // ---------- RESOLVE (admin) ----------
@@ -205,7 +213,6 @@ serve(async (req) => {
 
   if (!body.slug) return json(400, { ok: false, error: "slug_required" });
 
-  // load collection
   const { data: col, error: ge } = await supabase
     .from("collections")
     .select("*")
