@@ -18,9 +18,9 @@ type UpsertBody = {
   paginate?: number;
 };
 
-const PROJECT_URL = Deno.env.get("PROJECT_URL")!;
-const SERVICE_ROLE_KEY = Deno.env.get("SERVICE_ROLE_KEY")!;
-const DEFAULT_SITE_HOST = Deno.env.get("DEFAULT_SITE_HOST") || "hassan.skillyweb.com";
+const SUPABASE_URL              = Deno.env.get("SUPABASE_URL")!;
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+const DEFAULT_SITE_HOST         = Deno.env.get("DEFAULT_SITE_HOST") || "hassan.skillyweb.com";
 
 // Optional: simple auth so only callers who know the service key can hit this.
 // If you prefer, replace this with a separate ADMIN_FUNCTION_KEY secret.
@@ -29,7 +29,7 @@ function requireBearer(req: Request) {
   const token = hdr.toLowerCase().startsWith("bearer ")
     ? hdr.slice(7)
     : "";
-  if (!token || token !== SERVICE_ROLE_KEY) {
+  if (!token || token !== SUPABASE_SERVICE_ROLE_KEY) {
     return new Response(JSON.stringify({ ok: false, error: "unauthorized" }), {
       status: 401,
       headers: { "content-type": "application/json" },
@@ -68,7 +68,7 @@ serve(async (req) => {
 
   const site_host = body.site_host || DEFAULT_SITE_HOST;
 
-  const supabase = createClient(PROJECT_URL, SERVICE_ROLE_KEY, {
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
     auth: { persistSession: false },
   });
 
