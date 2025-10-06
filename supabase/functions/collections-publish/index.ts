@@ -1,18 +1,18 @@
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.3";
 
-const PROJECT_URL       = Deno.env.get("PROJECT_URL")!;
-const SERVICE_ROLE_KEY  = Deno.env.get("SERVICE_ROLE_KEY")!;
-const DEFAULT_SITE_HOST = Deno.env.get("DEFAULT_SITE_HOST")!;
-const WP_PUSH_URL       = Deno.env.get("WP_PUSH_URL")!;
-const WP_HMAC_SECRET    = Deno.env.get("WP_HMAC_SECRET")!; // required
+const SUPABASE_URL              = Deno.env.get("SUPABASE_URL")!;
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+const DEFAULT_SITE_HOST         = Deno.env.get("DEFAULT_SITE_HOST")!;
+const WP_PUSH_URL               = Deno.env.get("WP_PUSH_URL")!;
+const WP_HMAC_SECRET            = Deno.env.get("WP_HMAC_SECRET")!;
 
 type PublishInput = { slug: string; site_host?: string };
 
 function requireBearer(req: Request) {
   const a = req.headers.get("authorization") || "";
   const t = a.toLowerCase().startsWith("bearer ") ? a.slice(7) : "";
-  if (t !== SERVICE_ROLE_KEY) {
+  if (t !== SUPABASE_SERVICE_ROLE_KEY) {
     return new Response(JSON.stringify({ok:false,error:"unauthorized"}), {
       status: 401, headers: { "content-type": "application/json" },
     });
@@ -47,7 +47,7 @@ serve(async (req) => {
   }
 
   const site_host = input.site_host || DEFAULT_SITE_HOST;
-  const supabase = createClient(PROJECT_URL, SERVICE_ROLE_KEY, { auth: { persistSession:false } });
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession:false } });
 
   // 1) Load collection
   const { data: col, error } = await supabase
